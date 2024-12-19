@@ -37,7 +37,6 @@ http_proxy/
 │  ├─ connection_handler.cpp    // Реализация ConnectionHandler
 │  ├─ signal_handler.cpp        // Реализация SignalHandler
 │  ├─ logger.cpp                // Реализация Logger
-│  ├─ config.cpp                // При необходимости, реализация логики конфигурации
 │  └─ utils.cpp                 // Реализация утилитных функций (trim, parseUrl)
 ```
 

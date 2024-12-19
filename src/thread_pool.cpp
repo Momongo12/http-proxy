@@ -85,13 +85,16 @@ void ThreadPool::workerFunc() {
         }
 
         ConnectionHandler handler;
-        std::string response = handler.processRequest(req);
-        if (response.empty()) {
-            Logger::error("ThreadPool: Empty response from server");
-            response = "HTTP/1.0 502 Bad Gateway\r\n\r\nEmpty response\r\n";
+        if (!handler.processRequest(req, clientFd)) {
+            Logger::error("ThreadPool: processRequest failed, sending error to client");
+            std::string err = "HTTP/1.0 502 Bad Gateway\r\n\r\nError processing request\r\n";
+            send(clientFd, err.data(), err.size(), 0);
         }
-        send(clientFd, response.data(), response.size(), 0);
-        Logger::info("ThreadPool: Response sent to client");
+
+        // В этот момент данные уже отправлены клиенту внутри processRequest,
+        // либо в случае ошибки мы отправили сообщение об ошибке.
+
         close(clientFd);
+        Logger::info("ThreadPool: Finished handling client");
     }
 }

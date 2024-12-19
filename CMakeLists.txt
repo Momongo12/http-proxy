@@ -18,7 +18,6 @@ set(SOURCES
         src/redirect_handler.cpp
         src/signal_handler.cpp
         src/logger.cpp
-        src/config.cpp
         src/utils.cpp
 )
 

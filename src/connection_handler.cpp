@@ -1,134 +1,131 @@
 #include "connection_handler.hpp"
 #include "logger.hpp"
 #include "utils.hpp"
+#include <sys/types.h>
 #include <sys/socket.h>
 #include <netdb.h>
 #include <unistd.h>
 #include <sstream>
-#include <cstring>
+#include <string.h>
 
-std::string ConnectionHandler::processRequest(const HttpRequest &req) {
+bool ConnectionHandler::processRequest(const HttpRequest &req, int clientFd) {
     Logger::info("ConnectionHandler: processing request: " + req.method + " " + req.path);
 
-    auto it = req.headers.find("host");
-    if (it == req.headers.end()) {
-        Logger::error("ConnectionHandler: No Host header found");
-        return "HTTP/1.0 400 Bad Request\r\n\r\nHost header is required.\r\n";
-    }
-
-    std::string hostHeader = it->second;
     std::string host;
     int port;
     std::string path;
-    if (!parseHostAndPort(hostHeader, host, port, path)) {
-        Logger::error("ConnectionHandler: Invalid Host header: " + hostHeader);
-        return "HTTP/1.0 400 Bad Request\r\n\r\nInvalid Host header.\r\n";
+    if (!parseFinalUrl(req, host, port, path)) {
+        Logger::error("ConnectionHandler: Could not parse final URL from request");
+        std::string err = "HTTP/1.0 400 Bad Request\r\n\r\nInvalid URL.\r\n";
+        send(clientFd, err.data(), err.size(), 0);
+        return false;
     }
+
+    HttpRequest actualReq = req;
+    actualReq.path = path;
+    actualReq.headers["host"] = (port != 80) ? (host + ":" + std::to_string(port)) : host;
 
     int serverFd = connectToServer(host, port);
     if (serverFd < 0) {
         Logger::error("ConnectionHandler: Could not connect to " + host + ":" + std::to_string(port));
-        return "HTTP/1.0 502 Bad Gateway\r\n\r\nCould not connect to upstream server.\r\n";
+        std::string err = "HTTP/1.0 502 Bad Gateway\r\n\r\nCould not connect to upstream server.\r\n";
+        send(clientFd, err.data(), err.size(), 0);
+        return false;
     }
 
-    if (!sendRequest(serverFd, req)) {
+    if (!sendRequest(serverFd, actualReq)) {
         Logger::error("ConnectionHandler: Failed to send request to server");
         close(serverFd);
-        return "HTTP/1.0 502 Bad Gateway\r\n\r\nFailed to send request to server.\r\n";
+        std::string err = "HTTP/1.0 502 Bad Gateway\r\n\r\nFailed to send request.\r\n";
+        send(clientFd, err.data(), err.size(), 0);
+        return false;
     }
 
-    std::string response = readResponse(serverFd);
-    close(serverFd);
-    Logger::info("ConnectionHandler: received response, size=" + std::to_string(response.size()));
-
-    // Обработка редиректов:
-    int redirectCount = 0;
     std::string location;
-    while (isRedirect(response, location) && redirectCount < 5) {
-        Logger::info("ConnectionHandler: redirect to " + location);
-        std::string newHost;
-        int newPort;
-        std::string newPath;
-        if (!parseHostAndPort(location, newHost, newPort, newPath)) {
-            Logger::error("ConnectionHandler: invalid redirect location: " + location);
-            return response;
-        }
-        serverFd = connectToServer(newHost, newPort);
-        if (serverFd < 0) {
-            Logger::error("ConnectionHandler: Could not connect to redirect location: " + newHost + ":" + std::to_string(newPort));
-            return response;
-        }
-        HttpRequest newReq = req;
-        newReq.path = newPath;
-        // Host в запросе тоже нужно обновить, если редирект привел на другой домен
-        newReq.headers["host"] = newHost + ((newPort != 80) ? (":" + std::to_string(newPort)) : "");
+    int redirectCount = 0;
+    bool done = false;
 
-        if (!sendRequest(serverFd, newReq)) {
-            Logger::error("ConnectionHandler: Failed to send request after redirect");
+    // Читаем заголовки и проверяем на редирект.
+    // Если редирект - повторяем запрос.
+    while (!done) {
+        if (!readHeadersAndCheckRedirect(serverFd, clientFd, location)) {
+            // Если мы здесь, значит ошибка уже отправлена клиенту.
             close(serverFd);
-            return response;
+            return false;
         }
-        response = readResponse(serverFd);
-        close(serverFd);
-        redirectCount++;
+
+        if (!location.empty()) {
+            close(serverFd);
+            redirectCount++;
+            if (redirectCount > 5) {
+                Logger::error("ConnectionHandler: too many redirects");
+                // Заголовки редиректа уже отправлены клиенту, он сам решит, что делать
+                return true;
+            }
+
+            std::string newHost;
+            int newPort;
+            std::string newPath;
+            if (!parseRedirectUrl(location, newHost, newPort, newPath)) {
+                Logger::error("ConnectionHandler: invalid redirect location: " + location);
+                return true;
+            }
+
+            serverFd = connectToServer(newHost, newPort);
+            if (serverFd < 0) {
+                Logger::error("ConnectionHandler: Could not connect to redirect location: " + newHost + ":" + std::to_string(newPort));
+                return true;
+            }
+
+            HttpRequest newReq = req;
+            newReq.path = newPath;
+            newReq.headers["host"] = (newPort != 80) ? (newHost + ":" + std::to_string(newPort)) : newHost;
+
+            if (!sendRequest(serverFd, newReq)) {
+                Logger::error("ConnectionHandler: Failed to send request after redirect");
+                close(serverFd);
+                return true;
+            }
+
+            location.clear();
+            // Переходим к следующей итерации цикла, чтобы прочитать новые заголовки
+        } else {
+            // Не редирект, значит дальше тело ответа
+            if (!streamResponse(serverFd, clientFd)) {
+                Logger::error("ConnectionHandler: Error streaming response body");
+            }
+            close(serverFd);
+            done = true;
+        }
     }
 
-    return response;
+    return true;
 }
 
-bool ConnectionHandler::parseHostAndPort(const std::string &hostHeader, std::string &host, int &port, std::string &path) {
-    port = 80;
-    std::string h = Utils::trim(hostHeader);
-    path = "/";
-
-    std::string prefix_http = "http://";
-    std::string prefix_https = "https://";
-    bool isHttps = false;
-    if (h.compare(0, prefix_http.size(), prefix_http) == 0) {
-        h = h.substr(prefix_http.size());
-    } else if (h.compare(0, prefix_https.size(), prefix_https) == 0) {
-        h = h.substr(prefix_https.size());
-        isHttps = true;
-    }
-
-    if (isHttps) {
-        Logger::info("ConnectionHandler: https URL encountered, treating as http, port=80");
-        port = 80;
-    }
-
-    // Ищем первый '/'
-    auto slashPos = h.find('/');
-    std::string hostPort = (slashPos == std::string::npos) ? h : h.substr(0, slashPos);
-    if (slashPos != std::string::npos && slashPos+1 <= h.size()) {
-        // всё, что после '/' - это путь
-        path = h.substr(slashPos);
-        if (path.empty()) path = "/";
-    }
-
-    auto pos = hostPort.find(':');
-    if (pos == std::string::npos) {
-        host = Utils::trim(hostPort);
+bool ConnectionHandler::parseFinalUrl(const HttpRequest &req, std::string &host, int &port, std::string &path) {
+    // Если путь полный URL
+    if (req.path.find("http://") == 0 || req.path.find("https://") == 0) {
+        std::string scheme;
+        return Utils::parseUrl(req.path, scheme, host, port, path);
     } else {
-        host = Utils::trim(hostPort.substr(0, pos));
-        std::string portStr = Utils::trim(hostPort.substr(pos+1));
-        if (portStr.empty()) {
-            return false;
-        }
-        try {
-            port = std::stoi(portStr);
-        } catch (...) {
-            Logger::error("ConnectionHandler: invalid port in host header: " + portStr);
-            return false;
-        }
+        // Собираем URL из Host и path
+        auto it = req.headers.find("host");
+        if (it == req.headers.end()) return false;
+        std::string fullUrl = "http://" + Utils::trim(it->second) + req.path;
+        std::string scheme;
+        return Utils::parseUrl(fullUrl, scheme, host, port, path);
     }
+}
 
-    return !host.empty() && port > 0;
+bool ConnectionHandler::parseRedirectUrl(const std::string &location, std::string &host, int &port, std::string &path) {
+    std::string scheme;
+    return Utils::parseUrl(location, scheme, host, port, path);
 }
 
 int ConnectionHandler::connectToServer(const std::string &host, int port) {
     Logger::info("ConnectionHandler: connecting to " + host + ":" + std::to_string(port));
     struct addrinfo hints, *res;
-    memset(&hints, 0, sizeof(hints));
+    ::memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_INET;
     hints.ai_socktype = SOCK_STREAM;
     std::string portStr = std::to_string(port);
@@ -170,38 +167,76 @@ bool ConnectionHandler::sendRequest(int serverFd, const HttpRequest &req) {
     return true;
 }
 
-std::string ConnectionHandler::readResponse(int serverFd) {
-    Logger::info("ConnectionHandler: reading response from server");
-    std::string response;
+bool ConnectionHandler::readHeadersAndCheckRedirect(int serverFd, int clientFd, std::string &location) {
+    location.clear();
+    std::string headers;
+    char c;
+    bool headersDone = false;
+
+    // Читаем заголовки до \r\n\r\n
+    while (!headersDone) {
+        ssize_t r = recv(serverFd, &c, 1, 0);
+        if (r <= 0) {
+            // Сервер закрыл соединение или ошибка
+            std::string err = "HTTP/1.0 502 Bad Gateway\r\n\r\nEmpty or invalid response\r\n";
+            send(clientFd, err.data(), err.size(), 0);
+            return false;
+        }
+        headers.push_back(c);
+        int len = (int)headers.size();
+        if (len >= 4 && headers.substr(len-4) == "\r\n\r\n") {
+            headersDone = true;
+        }
+    }
+
+    if (headers.empty()) {
+        std::string err = "HTTP/1.0 502 Bad Gateway\r\n\r\nEmpty response\r\n";
+        send(clientFd, err.data(), err.size(), 0);
+        return false;
+    }
+
+    // Проверяем на редирект (3xx)
+    auto pos = headers.find("\r\n");
+    if (pos != std::string::npos) {
+        std::string startLine = headers.substr(0, pos);
+        if (startLine.find(" 3") != std::string::npos) {
+            // Ищем Location
+            auto locPos = headers.find("\r\nLocation:");
+            if (locPos == std::string::npos) {
+                locPos = headers.find("\r\nlocation:");
+            }
+            if (locPos != std::string::npos) {
+                locPos += 2;
+                auto endPos = headers.find("\r\n", locPos);
+                if (endPos != std::string::npos) {
+                    std::string locLine = headers.substr(locPos, endPos - locPos);
+                    auto colonPos = locLine.find(':');
+                    if (colonPos != std::string::npos) {
+                        location = Utils::trim(locLine.substr(colonPos+1));
+                        // Отправим заголовки клиенту - он увидит 3xx и Location
+                        send(clientFd, headers.data(), headers.size(), 0);
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+
+    // Не редирект, отправляем заголовки клиенту
+    send(clientFd, headers.data(), headers.size(), 0);
+    return true;
+}
+
+bool ConnectionHandler::streamResponse(int serverFd, int clientFd) {
     char buf[4096];
     ssize_t n;
     while ((n = recv(serverFd, buf, sizeof(buf), 0)) > 0) {
-        response.append(buf, n);
+        ssize_t totalSent = 0;
+        while (totalSent < n) {
+            ssize_t s = send(clientFd, buf + totalSent, n - totalSent, 0);
+            if (s <= 0) return false;
+            totalSent += s;
+        }
     }
-    Logger::info("ConnectionHandler: response size = " + std::to_string(response.size()));
-    return response;
-}
-
-bool ConnectionHandler::isRedirect(const std::string &response, std::string &location) {
-    // Ищем код 3xx
-    auto pos = response.find("\r\n");
-    if (pos == std::string::npos) return false;
-    std::string startLine = response.substr(0, pos);
-    if (startLine.find(" 3") == std::string::npos) return false;
-
-    auto locPos = response.find("\r\nLocation:");
-    if (locPos == std::string::npos) {
-        locPos = response.find("\r\nlocation:");
-        if (locPos == std::string::npos) return false;
-    }
-    locPos += 2;
-    auto endPos = response.find("\r\n", locPos);
-    if (endPos == std::string::npos) return false;
-    std::string locLine = response.substr(locPos, endPos - locPos);
-    // locLine что-то вроде "Location: http://example.com"
-    auto colonPos = locLine.find(':');
-    if (colonPos == std::string::npos) return false;
-    location = Utils::trim(locLine.substr(colonPos+1));
-    Logger::info("ConnectionHandler: found redirect location: " + location);
-    return !location.empty();
+    return true;
 }
