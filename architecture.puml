@@ -1,0 +1,67 @@
+@startuml
+
+class ProxyApp {
+  +parseArgs(argc, argv)
+  +init()
+  +run()
+  +shutdown()
+}
+
+class Listener {
+  +startListening(port: int): bool
+  +acceptClient(): int
+}
+
+class ThreadPool {
+  +init(numThreads: int): bool
+  +submitTask(clientFd: int)
+  +shutdown()
+}
+
+class HttpRequest {
+  +method : string
+  +path : string
+  +version : string
+  +headers : map<string, string>
+}
+
+class HttpParser {
+  +parse(data: string, request: HttpRequest): bool
+}
+
+class ConnectionHandler {
+  +processRequest(req: HttpRequest): string
+}
+
+class SignalHandler {
+  +init()
+  +shouldShutdown(): bool
+}
+
+class Logger {
+  +info(msg: string)
+  +error(msg: string)
+}
+
+class Config {
+  +port : int
+  +maxThreads : int
+}
+
+class Utils {
+  +trim(s: string): string
+  +parseUrl(url: string, scheme: string&, host: string&, port: int&, path: string&): bool
+}
+
+ProxyApp --> Listener : uses
+ProxyApp --> ThreadPool : uses
+ThreadPool --> HttpParser : uses
+ThreadPool --> ConnectionHandler : uses
+ConnectionHandler --> Utils : uses parseUrl
+ThreadPool --> Logger : logs
+ProxyApp --> SignalHandler : uses
+ProxyApp --> Logger : logs
+ConnectionHandler --> Logger : logs
+HttpParser --> Utils : uses trim
+
+@enduml
