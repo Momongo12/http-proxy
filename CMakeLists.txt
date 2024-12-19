@@ -13,7 +13,6 @@ set(SOURCES
         src/proxy_app.cpp
         src/listener.cpp
         src/thread_pool.cpp
-        src/worker_thread.cpp
         src/http_parser.cpp
         src/connection_handler.cpp
         src/redirect_handler.cpp
