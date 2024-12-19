@@ -6,7 +6,6 @@
 
 class ConnectionHandler {
 public:
-    // Теперь processRequest принимает clientFd, чтобы сразу слать ответ клиенту
     bool processRequest(const HttpRequest &req, int clientFd);
 
 private:
@@ -14,10 +13,16 @@ private:
     bool parseRedirectUrl(const std::string &location, std::string &host, int &port, std::string &path);
     int connectToServer(const std::string &host, int port);
     bool sendRequest(int serverFd, const HttpRequest &req);
-    bool streamResponse(int serverFd, int clientFd);
-    bool isRedirect(const std::string &partialResponse, std::string &location);
-    bool handleRedirects(const HttpRequest &originalReq, int clientFd, std::string &response, int redirectCount);
     bool readHeadersAndCheckRedirect(int serverFd, int clientFd, std::string &location);
+    bool streamResponse(int serverFd, int clientFd);
+
+    bool chunked = false;
+    bool haveContentLength = false;
+    size_t contentLength = 0;
+
+    bool streamChunkedResponse(int serverFd, int clientFd);
+    bool streamRawResponse(int serverFd, int clientFd);
+    bool streamWithContentLength(int serverFd, int clientFd, size_t length);
 };
 
 #endif // CONNECTION_HANDLER_HPP
