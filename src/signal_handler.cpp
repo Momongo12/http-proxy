@@ -13,7 +13,7 @@ void SignalHandler::init() {
     sigemptyset(&sa.sa_mask);
     sa.sa_flags = 0;
     sigaction(SIGINT, &sa, nullptr);
-    sigaction(SIGTERM, &sa, nullptr);
+    sigaction(SIGQUIT, &sa, nullptr);
 }
 
 bool SignalHandler::shouldShutdown() {
